@@ -217,6 +217,27 @@ jobs:
         
         # Extract the tarball
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
+
+    - name: Verify ROCm tools
+      run: |
+        $red = "`e[31m"
+        $reset = "`e[0m"
+        $rocminfo = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocminfo*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $smi      = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocm-smi*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if ($rocminfo) {
+          Write-Host "rocminfo is available at $($rocminfo.FullName)"
+          & $rocminfo.FullName | Select-String "" -First 20 | ForEach-Object { $_.Line }
+        } else {
+          Write-Host "${red}rocminfo not found in ROCm build${reset}"
+        }
+
+        if ($smi) {
+          Write-Host "rocm-smi is available at $($smi.FullName)"
+          & $smi.FullName --showdriverversion
+        } else {
+          Write-Host "${red}rocm-smi not found in ROCm build${reset}"
+        }
         
     - name: Clone llama.cpp
       run: |
@@ -580,6 +601,25 @@ jobs:
         echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
         
         echo "ROCm environment variables set successfully"
+
+    - name: Verify ROCm tools
+      run: |
+        RED='\033[0;31m'
+        NC='\033[0m' # no color
+
+        if [ -x /opt/rocm/bin/rocminfo ]; then
+          echo "rocminfo is available"
+          /opt/rocm/bin/rocminfo | head -20 || true
+        else
+          echo -e "${RED}rocminfo not found in ROCm build${NC}"
+        fi
+
+        if [ -x /opt/rocm/bin/rocm-smi ]; then
+          echo "rocm-smi is available"
+          /opt/rocm/bin/rocm-smi --showdriverversion || true
+        else
+          echo -e "${RED}rocm-smi not found in ROCm build${NC}"
+        fi
         
     - name: Clone llama.cpp
       run: |
