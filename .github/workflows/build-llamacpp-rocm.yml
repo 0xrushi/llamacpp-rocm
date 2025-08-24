@@ -1,4 +1,4 @@
-name: Build Llama.cpp + ROCm
+name: Build Llama.cpp + ROCm with Tools
 on:
   workflow_dispatch:
     inputs:
@@ -217,28 +217,31 @@ jobs:
         
         # Extract the tarball
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
-
-    - name: Verify ROCm tools
+        
+    - name: Install rocWMMA headers (develop)
       run: |
-        $red = "`e[31m"
-        $reset = "`e[0m"
-        $rocminfo = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocminfo*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        $smi      = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocm-smi*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-
-        if ($rocminfo) {
-          Write-Host "rocminfo is available at $($rocminfo.FullName)"
-          & $rocminfo.FullName | Select-String "" -First 20 | ForEach-Object { $_.Line }
-        } else {
-          Write-Host "${red}rocminfo not found in ROCm build${reset}"
+        $repoUrl = "https://github.com/ROCm/rocWMMA.git"
+        $cloneDir = Join-Path $env:TEMP "rocWMMA-develop"
+        $destIncludeDir = "C:\opt\rocm\include"
+        $destHeaders = Join-Path $destIncludeDir "rocwmma"
+        
+        if (Test-Path $cloneDir) { Remove-Item -Recurse -Force $cloneDir }
+        Write-Host "Cloning rocWMMA develop branch..."
+        git clone --depth 1 --branch develop $repoUrl $cloneDir
+        
+        $srcHeaders = Join-Path $cloneDir "library\include\rocwmma"
+        if (!(Test-Path $srcHeaders)) {
+          Write-Error "rocWMMA headers not found at expected path: $srcHeaders"
+          exit 1
         }
-
-        if ($smi) {
-          Write-Host "rocm-smi is available at $($smi.FullName)"
-          & $smi.FullName --showdriverversion
-        } else {
-          Write-Host "${red}rocm-smi not found in ROCm build${reset}"
-        }
-
+        
+        Write-Host "Installing headers to $destHeaders ..."
+        New-Item -ItemType Directory -Force -Path $destIncludeDir | Out-Null
+        if (Test-Path $destHeaders) { Remove-Item -Recurse -Force $destHeaders }
+        Copy-Item -Recurse -Force $srcHeaders $destHeaders
+        
+        Write-Host "rocWMMA headers (develop) installed successfully."
+        
     - name: Clone llama.cpp
       run: |
         git clone https://github.com/ggerganov/llama.cpp.git
@@ -275,6 +278,13 @@ jobs:
         } else {
           Write-Host "Warning: $hipFile not found"
         }
+
+    - name: Apply rocWMMA patch (non-interactive)
+      shell: bash
+      run: |
+        chmod +x utils/rocwmma_patch.sh
+        # Run non-interactively; keep backups (answer 'n')
+        printf "n\n" | ./utils/rocwmma_patch.sh ./llama.cpp
         
     - name: Build Llama.cpp + ROCm
       shell: cmd
@@ -322,7 +332,7 @@ jobs:
           -DGGML_HIP=ON ^
           -DGGML_OPENMP=OFF ^
           -DGGML_CUDA_FORCE_CUBLAS=OFF ^
-          -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+          -DGGML_HIP_ROCWMMA_FATTN=ON ^
           -DGGML_HIP_FORCE_ROCWMMA_FATTN_GFX12=OFF ^
           -DLLAMA_CURL=OFF ^
           -DGGML_NATIVE=OFF ^
@@ -332,19 +342,19 @@ jobs:
         REM Build the project
         cmake --build . -j %NUMBER_OF_PROCESSORS%
         
-    - name: Copy ROCm core DLLs to build directory
+    - name: Copy ROCm core DLLs and tools to build directory
       run: |
         $rocmVersion = if ($env:DETECTED_ROCM_VERSION) { $env:DETECTED_ROCM_VERSION } else { $env:ROCM_VERSION }
         $buildBinPath = "llama.cpp\build\bin"
         $rocmBinPath = "C:\opt\rocm\bin"
         
-        Write-Host "Copying ROCm core DLL files to build directory..."
+        Write-Host "Copying ROCm core DLL files and tools to build directory..."
         Write-Host "Source: $rocmBinPath"
         Write-Host "Destination: $buildBinPath"
         
         if (Test-Path $rocmBinPath) {
-          # Copy files matching patterns and specific names
-          $filesToCopy = @(
+          # Copy core runtime DLLs
+          $runtimeFilesToCopy = @(
             "amdhip64_*.dll",
             "amd_comgr*.dll", 
             "libhipblas.dll",
@@ -353,69 +363,141 @@ jobs:
             "hipblaslt.dll"
           )
           
-          foreach ($pattern in $filesToCopy) {
+          foreach ($pattern in $runtimeFilesToCopy) {
             $matchingFiles = Get-ChildItem -Path $rocmBinPath -Name $pattern -ErrorAction SilentlyContinue
             if ($matchingFiles) {
               foreach ($file in $matchingFiles) {
                 $sourcePath = Join-Path $rocmBinPath $file
                 $destPath = Join-Path $buildBinPath $file
                 Copy-Item $sourcePath $destPath
-                Write-Host "Copied: $file"
+                Write-Host "Copied runtime file: $file"
               }
             } else {
               Write-Host "Warning: No files found matching pattern: $pattern"
             }
           }
           
+          # Copy ROCm tools (executables)
+          $rocmToolsPatterns = @(
+            "rocm-smi.exe",
+            "rocminfo.exe",
+            "rocm_agent_enumerator.exe",
+            "roc-profiler.exe",
+            "roc-prof.exe",
+            "rocprofv2.exe",
+            "rocm_bandwidth_test.exe",
+            "hipcc.exe",
+            "hipconfig.exe",
+            "hip_version.exe"
+          )
+          
+          # Create a tools subdirectory
+          $toolsDir = Join-Path $buildBinPath "rocm-tools"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          
+          foreach ($tool in $rocmToolsPatterns) {
+            $toolPath = Join-Path $rocmBinPath $tool
+            if (Test-Path $toolPath) {
+              $destPath = Join-Path $toolsDir $tool
+              Copy-Item $toolPath $destPath
+              Write-Host "Copied tool: $tool"
+            } else {
+              Write-Host "Tool not found (optional): $tool"
+            }
+          }
+          
+          # Copy additional tools with wildcards
+          $additionalToolPatterns = @(
+            "hip*.exe",
+            "roc*.exe",
+            "clang*.exe"
+          )
+          
+          foreach ($pattern in $additionalToolPatterns) {
+            $matchingTools = Get-ChildItem -Path $rocmBinPath -Name $pattern -ErrorAction SilentlyContinue
+            if ($matchingTools) {
+              foreach ($tool in $matchingTools) {
+                # Skip if already copied
+                $destPath = Join-Path $toolsDir $tool
+                if (!(Test-Path $destPath)) {
+                  $sourcePath = Join-Path $rocmBinPath $tool
+                  Copy-Item $sourcePath $destPath
+                  Write-Host "Copied additional tool: $tool"
+                }
+              }
+            }
+          }
+          
           # Copy the rocblas\library folder and all its contents
-          $rocblasLibPath = Join-Path "C:\opt\rocm\lib" "rocblas\library"
+          $rocblasLibPath = Join-Path $rocmBinPath "rocblas\library"
           if (Test-Path $rocblasLibPath) {
             Write-Host "Copying rocblas\library folder and all contents..."
             $destRocblasPath = Join-Path $buildBinPath "rocblas\library"
             Copy-Item -Path $rocblasLibPath -Destination $destRocblasPath -Recurse -Force
             Write-Host "Copied: rocblas\library folder with all contents"
-            
-            # List the contents of the copied rocblas\library folder
-            Write-Host "Contents of rocblas\library:"
-            Get-ChildItem $destRocblasPath -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
           } else {
             Write-Host "Warning: rocblas\library folder not found at: $rocblasLibPath"
           }
           
-          Write-Host "ROCm core files successfully copied to build directory"
+          # Copy supporting DLLs needed by tools
+          $supportingDlls = @(
+            "hsa-runtime64.dll",
+            "rocprofiler64.dll",
+            "roctracer64.dll",
+            "roctx64.dll"
+          )
+          
+          foreach ($dll in $supportingDlls) {
+            $dllPath = Join-Path $rocmBinPath $dll
+            if (Test-Path $dllPath) {
+              $destPath = Join-Path $buildBinPath $dll
+              Copy-Item $dllPath $destPath
+              Write-Host "Copied supporting DLL: $dll"
+            } else {
+              Write-Host "Supporting DLL not found (optional): $dll"
+            }
+          }
+          
+          # Create a convenience script to add tools to PATH
+          $scriptContent = @"
+@echo off
+REM Add ROCm tools to PATH for this session
+set "ROCM_TOOLS_PATH=%~dp0rocm-tools"
+set "PATH=%ROCM_TOOLS_PATH%;%PATH%"
+
+echo ROCm tools added to PATH for this session.
+echo Available tools in %ROCM_TOOLS_PATH%:
+dir /b "%ROCM_TOOLS_PATH%\*.exe"
+echo.
+echo You can now use tools like: rocm-smi, rocminfo, etc.
+cmd /k
+"@
+          Set-Content -Path (Join-Path $buildBinPath "setup-rocm-tools.bat") -Value $scriptContent
+          Write-Host "Created setup-rocm-tools.bat convenience script"
+          
+          Write-Host "ROCm core files and tools successfully copied to build directory"
         } else {
           Write-Error "ROCm bin directory not found: $rocmBinPath"
           exit 1
         }
-
-    - name: Include ROCm tools in artifact (Windows)
-      run: |
-        $red = "`e[31m"; $reset = "`e[0m"
-        $dest = "llama.cpp\build\bin\rocm-tools"
-        New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-        $rocminfo = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocminfo*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($rocminfo) { Copy-Item $rocminfo.FullName $dest -Force } else { Write-Host "${red}rocminfo not found in C:\opt\rocm\bin (skipping)${reset}" }
-
-        $smi = Get-ChildItem -Path "C:\opt\rocm\bin" -Filter "rocm-smi*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($smi) { Copy-Item $smi.FullName $dest -Force } else { Write-Host "${red}rocm-smi not found in C:\opt\rocm\bin (skipping)${reset}" }
-
-        Write-Host "rocm-tools contents:"
-        Get-ChildItem $dest -Force | Select-Object Name,Length | Format-Table -AutoSize
         
-    - name: List build artifacts (including ROCm files)
+    - name: List build artifacts (including ROCm files and tools)
       run: |
         cd llama.cpp\build\bin
-        Write-Host "Final build artifacts (including ROCm core files):"
+        Write-Host "Final build artifacts (including ROCm core files and tools):"
         Get-ChildItem -Recurse | Format-Table Name, Length, LastWriteTime
+        
+        Write-Host "`nROCm tools available:"
+        if (Test-Path "rocm-tools") {
+          Get-ChildItem "rocm-tools\*.exe" | Format-Table Name, Length
+        }
         
     - name: Upload build artifacts
       id: upload-artifacts
       uses: actions/upload-artifact@v4
       with:
         name: llama-windows-rocm-${{ matrix.gfx_target }}-x64
-        path: llama.cpp/build/bin/**
-        if-no-files-found: error
+        path: llama.cpp/build/bin/
         retention-days: 30
         
     - name: Set job outputs
@@ -448,6 +530,20 @@ jobs:
         
         ## Build Artifacts
         The compiled binaries are available in the build artifacts.
+        
+        ## ROCm Tools Included
+        This build includes ROCm diagnostic and profiling tools:
+        - rocm-smi.exe - System Management Interface
+        - rocminfo.exe - System information utility
+        - rocm_agent_enumerator.exe - Agent enumeration tool
+        - rocm_bandwidth_test.exe - Memory bandwidth testing
+        - hipcc.exe, hipconfig.exe - HIP compiler tools
+        - And additional profiling and development tools
+        
+        ### Using ROCm Tools
+        1. Extract the build artifacts
+        2. Run setup-rocm-tools.bat to add tools to your PATH
+        3. Use tools like: rocm-smi, rocminfo, etc.
 
         "@
         
@@ -532,7 +628,7 @@ jobs:
       run: |
         echo "Installing build dependencies..."
         sudo apt update
-        sudo apt install -y cmake ninja-build
+        sudo apt install -y cmake ninja-build unzip curl
         
         # Verify installations
         echo "Verifying installations..."
@@ -575,7 +671,7 @@ jobs:
           
           # Use the exact filename from S3 instead of reconstructing
           rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
-        } else {
+        else
           # For specific versions, construct the URL as before
           rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
         fi
@@ -593,25 +689,6 @@ jobs:
         
         # Extract the tarball
         sudo tar -xzf rocm.tar.gz -C /opt/rocm --strip-components=1
-        
-    - name: Verify ROCm tools
-      run: |
-        RED='\033[0;31m'
-        NC='\033[0m' # no color
-
-        if [ -x /opt/rocm/bin/rocminfo ]; then
-          echo "rocminfo is available"
-          /opt/rocm/bin/rocminfo | head -20 || true
-        else
-          echo -e "${RED}rocminfo not found in ROCm build${NC}"
-        fi
-
-        if [ -x /opt/rocm/bin/rocm-smi ]; then
-          echo "rocm-smi is available"
-          /opt/rocm/bin/rocm-smi --showdriverversion || true
-        else
-          echo -e "${RED}rocm-smi not found in ROCm build${NC}"
-        fi
         
     - name: Set ROCm environment variables
       run: |
@@ -636,6 +713,24 @@ jobs:
         echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
         
         echo "ROCm environment variables set successfully"
+        
+    - name: Install rocWMMA headers (develop)
+      run: |
+        set -e
+        TMP_DIR="$(mktemp -d)"
+        echo "Using temp directory: $TMP_DIR"
+        git clone --depth 1 --branch develop https://github.com/ROCm/rocWMMA.git "$TMP_DIR/rocWMMA"
+        SRC_DIR="$TMP_DIR/rocWMMA/library/include/rocwmma"
+        if [ ! -d "$SRC_DIR" ]; then
+          echo "rocWMMA headers not found at expected path: $SRC_DIR"
+          exit 1
+        fi
+        echo "Installing headers to /opt/rocm/include/rocwmma ..."
+        sudo mkdir -p /opt/rocm/include
+        sudo rm -rf /opt/rocm/include/rocwmma
+        sudo cp -r "$SRC_DIR" /opt/rocm/include/
+        rm -rf "$TMP_DIR"
+        echo "rocWMMA headers (develop) installed successfully."
         
     - name: Clone llama.cpp
       run: |
@@ -671,6 +766,12 @@ jobs:
         else
           echo "Warning: $hip_file not found"
         fi
+
+    - name: Apply rocWMMA patch (non-interactive)
+      run: |
+        chmod +x utils/rocwmma_patch.sh
+        # Run non-interactively; keep backups (answer 'n')
+        printf "n\n" | ./utils/rocwmma_patch.sh ./llama.cpp
         
     - name: Build Llama.cpp + ROCm
       run: |
@@ -706,7 +807,7 @@ jobs:
           -DGGML_HIP=ON \
           -DGGML_OPENMP=OFF \
           -DGGML_CUDA_FORCE_CUBLAS=OFF \
-          -DGGML_HIP_ROCWMMA_FATTN=OFF \
+          -DGGML_HIP_ROCWMMA_FATTN=ON \
           -DGGML_HIP_FORCE_ROCWMMA_FATTN_GFX12=OFF \
           -DLLAMA_CURL=OFF \
           -DGGML_NATIVE=OFF \
@@ -716,10 +817,14 @@ jobs:
         # Build the project
         cmake --build . -j $(nproc)
         
-    - name: Copy ROCm core libs to build directory
+    - name: Copy ROCm core libs and tools to build directory
       run: |
         build_bin_path="llama.cpp/build/bin"
         rocm_bin_path="/opt/rocm/bin"
+        
+        echo "Copying ROCm core libraries and tools to build directory..."
+        echo "Source: $rocm_bin_path"
+        echo "Destination: $build_bin_path"
         
         # Copy the rocblas/library folder and all its contents
         rocblas_lib_path="/opt/rocm/lib/rocblas/library"
@@ -729,18 +834,11 @@ jobs:
           mkdir -p "$(dirname "$dest_rocblas_path")"
           cp -r "$rocblas_lib_path" "$(dirname "$dest_rocblas_path")/"
           echo "Copied: rocblas/library folder with all contents"
-          
-          # List the contents of the copied rocblas/library folder
-          echo "Contents of rocblas/library:"
-          find "$dest_rocblas_path" -type f -exec ls -la {} \; | head -20
         else
           echo "Warning: rocblas/library folder not found at: $rocblas_lib_path"
         fi
  
         # Copy required ROCm libraries to build directory
-        # If artifacts from ROCm or Llama.cpp change, you may need to update this list
-        # To get a new list of all libraries, run:
-        # gather_required_libs.py --rocm-dir /opt/rocm --dest-dir llama.cpp/build/bin
         echo "Copying required ROCm libraries to build directory..."
         cp -v /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
         cp -v /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
@@ -761,37 +859,115 @@ jobs:
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
 
-        echo "Finished copying required ROCm libraries"
-
-    - name: Include ROCm tools in artifact (Ubuntu)
-      run: |
-        RED='\033[0;31m'; NC='\033[0m'
-        dest="llama.cpp/build/bin/rocm-tools"
-        mkdir -p "$dest"
-        for tool in rocminfo rocm-smi; do
-          if [ -x "/opt/rocm/bin/$tool" ]; then
-            cp -v "/opt/rocm/bin/$tool" "$dest/"
-          elif [ -f "/opt/rocm/bin/${tool}.py" ]; then
-            cp -v "/opt/rocm/bin/${tool}.py" "$dest/"
+        # Copy ROCm tools (executables)
+        echo "Copying ROCm tools..."
+        
+        # Create a tools subdirectory
+        tools_dir="$build_bin_path/rocm-tools"
+        mkdir -p "$tools_dir"
+        
+        # List of ROCm tools to copy
+        rocm_tools=(
+          "rocm-smi"
+          "rocminfo"
+          "rocm_agent_enumerator"
+          "roc-profiler"
+          "roc-prof"
+          "rocprofv2"
+          "rocm_bandwidth_test"
+          "hipcc"
+          "hipconfig"
+          "hip_version"
+          "clang"
+          "clang++"
+        )
+        
+        for tool in "${rocm_tools[@]}"; do
+          if [ -f "/opt/rocm/bin/$tool" ]; then
+            cp -v "/opt/rocm/bin/$tool" "$tools_dir/"
+            echo "Copied tool: $tool"
           else
-            echo -e "${RED}${tool} not found in /opt/rocm/bin (skipping)${NC}"
+            echo "Tool not found (optional): $tool"
           fi
         done
-        echo "rocm-tools contents:"; find "$dest" -maxdepth 1 -type f -printf "%P\n" | sort || true
         
-    - name: List build artifacts (including ROCm files)
+        # Copy additional tools with pattern matching
+        if [ -d "/opt/rocm/bin" ]; then
+          # Copy all hip* tools
+          find /opt/rocm/bin -name "hip*" -type f -executable -exec cp -v {} "$tools_dir/" \; 2>/dev/null || echo "No additional hip tools found"
+          
+          # Copy all roc* tools
+          find /opt/rocm/bin -name "roc*" -type f -executable -exec cp -v {} "$tools_dir/" \; 2>/dev/null || echo "No additional roc tools found"
+        fi
+        
+        # Copy supporting libraries needed by tools
+        echo "Copying supporting libraries for tools..."
+        supporting_libs=(
+          "libhsa-runtime64.so"
+          "librocprofiler64.so"
+          "libroctracer64.so"
+          "libroctx64.so"
+        )
+        
+        for lib in "${supporting_libs[@]}"; do
+          if [ -f "/opt/rocm/lib/$lib" ]; then
+            cp -v /opt/rocm/lib/$lib* "$build_bin_path/" 2>/dev/null || echo "$lib not found"
+            echo "Copied supporting library: $lib"
+          else
+            echo "Supporting library not found (optional): $lib"
+          fi
+        done
+        
+        # Create a convenience script to set up environment for tools
+        cat > "$build_bin_path/setup-rocm-tools.sh" << 'EOF'
+#!/bin/bash
+# Add ROCm tools to PATH and set up environment for this session
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROCM_TOOLS_PATH="$SCRIPT_DIR/rocm-tools"
+
+# Add tools to PATH
+export PATH="$ROCM_TOOLS_PATH:$PATH"
+
+# Set up library path for tools
+export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
+
+echo "ROCm tools added to PATH for this session."
+echo "Available tools in $ROCM_TOOLS_PATH:"
+ls -1 "$ROCM_TOOLS_PATH" | grep -E '^(rocm|roc|hip)' | sort
+echo ""
+echo "You can now use tools like: rocm-smi, rocminfo, etc."
+
+# If running interactively, start a new shell
+if [ -t 1 ]; then
+    echo "Starting new shell with ROCm tools available..."
+    bash
+fi
+EOF
+        
+        chmod +x "$build_bin_path/setup-rocm-tools.sh"
+        echo "Created setup-rocm-tools.sh convenience script"
+
+        echo "Finished copying ROCm libraries and tools"
+        
+    - name: List build artifacts (including ROCm files and tools)
       run: |
         cd llama.cpp/build/bin
-        echo "Final build artifacts (including ROCm library files):"
+        echo "Final build artifacts (including ROCm library files and tools):"
         ls -la
+        
+        echo ""
+        echo "ROCm tools available:"
+        if [ -d "rocm-tools" ]; then
+          ls -la rocm-tools/
+        fi
         
     - name: Upload build artifacts
       id: upload-artifacts
       uses: actions/upload-artifact@v4
       with:
         name: llama-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: llama.cpp/build/bin/**
-        if-no-files-found: error
+        path: llama.cpp/build/bin/
         retention-days: 30
         
     - name: Set job outputs
@@ -824,6 +1000,36 @@ jobs:
         
         ## Build Artifacts
         The compiled binaries are available in the build artifacts.
+        
+        ## ROCm Tools Included
+        This build includes ROCm diagnostic and profiling tools:
+        - rocm-smi - System Management Interface
+        - rocminfo - System information utility
+        - rocm_agent_enumerator - Agent enumeration tool
+        - rocm_bandwidth_test - Memory bandwidth testing
+        - hipcc, hipconfig - HIP compiler tools
+        - roc-profiler, rocprofv2 - Profiling tools
+        - And additional development tools
+        
+        ### Using ROCm Tools
+        1. Extract the build artifacts
+        2. Run: `source setup-rocm-tools.sh` to add tools to your PATH
+        3. Use tools like: `rocm-smi`, `rocminfo`, etc.
+        
+        ### Example Usage
+        ```bash
+        # Extract and setup
+        unzip llama-*-ubuntu-rocm-*.zip
+        cd extracted-folder
+        source setup-rocm-tools.sh
+        
+        # Check GPU information
+        rocm-smi
+        rocminfo
+        
+        # Run llama.cpp
+        ./llama-server --help
+        ```
         EOF
         
     - name: Upload build summary
@@ -893,7 +1099,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         # Get all existing release tags that match the pattern b####
-        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
+        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4} | sort -V || echo "")
         
         if [ -z "$existing_tags" ]; then
           # No existing sequential tags found, start with b1000
@@ -1014,7 +1220,7 @@ jobs:
         
         # Create release with GitHub CLI
         gh release create "$TAG" \
-          --title "$TAG" \
+          --title "$TAG - Llama.cpp + ROCm with Tools" \
           --notes "**Build Number**: $TAG
         **Operating System(s)**: $operating_systems
         **GPU Target(s)**: $targets
@@ -1022,5 +1228,43 @@ jobs:
         **Llama.cpp Commit Hash**: $LLAMACPP_COMMIT_HASH
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        This release includes compiled llama.cpp binaries with ROCm support for multiple GPU targets and operating systems, with all essential ROCm runtime libraries included." \
+        This release includes compiled llama.cpp binaries with ROCm support for multiple GPU targets and operating systems, with all essential ROCm runtime libraries **and diagnostic tools** included.
+
+        ## What's Included
+        - Llama.cpp binaries optimized for AMD GPUs
+        - All required ROCm runtime libraries
+        - **ROCm diagnostic and profiling tools**:
+          - \`rocm-smi\` - System Management Interface
+          - \`rocminfo\` - System information utility  
+          - \`rocm_agent_enumerator\` - GPU agent enumeration
+          - \`rocm_bandwidth_test\` - Memory bandwidth testing
+          - \`hipcc\`, \`hipconfig\` - HIP compiler tools
+          - \`roc-profiler\`, \`rocprofv2\` - Performance profiling
+          - Additional development and diagnostic tools
+
+        ## Quick Start
+        ### Windows
+        1. Extract the zip file
+        2. Run \`setup-rocm-tools.bat\` to add tools to PATH
+        3. Use: \`rocm-smi\`, \`rocminfo\`, \`llama-server\`, etc.
+
+        ### Ubuntu/Linux  
+        1. Extract the zip file
+        2. Run: \`source setup-rocm-tools.sh\`
+        3. Use: \`rocm-smi\`, \`rocminfo\`, \`./llama-server\`, etc.
+
+        ## Example Usage
+        \`\`\`bash
+        # Check GPU status
+        rocm-smi
+        rocminfo
+        
+        # Test memory bandwidth
+        rocm_bandwidth_test
+        
+        # Run llama.cpp server
+        ./llama-server --model your-model.gguf --host 0.0.0.0 --port 8080
+        \`\`\`
+
+        **Note**: All builds include both the llama.cpp binaries and ROCm diagnostic tools in a single package for easy deployment and troubleshooting." \
           $upload_files
