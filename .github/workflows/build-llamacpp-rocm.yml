@@ -804,6 +804,11 @@ jobs:
         else
           echo "libexec/rocm_smi not found at $rocm_libexec_path"
         fi
+
+        # Also place librocm_smi64 in build/lib to satisfy rocm-smi's relative lookup: libexec/rocm_smi/../../lib
+        build_lib_path="llama.cpp/build/lib"
+        mkdir -p "$build_lib_path"
+        cp -v "$rocm_lib_path/librocm_smi64.so"* "$build_lib_path/" 2>/dev/null || echo "librocm_smi64.so* not found for build/lib"
         
     - name: List build artifacts (including ROCm files)
       run: |
