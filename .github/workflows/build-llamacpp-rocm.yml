@@ -371,6 +371,7 @@ jobs:
       run: |
         $buildBinPath = "llama.cpp\build\bin"
         $rocmBinPath = "C:\opt\rocm\bin"
+        $rocmLibPath = "C:\opt\rocm\lib"
         
         Write-Host "Copying ROCm tools (rocminfo, rocm-smi) to build directory..."
         Write-Host "Source: $rocmBinPath"
@@ -399,6 +400,38 @@ jobs:
               Write-Host "Info: No files found matching pattern: $pattern"
             }
           }
+
+          # Copy ROCm SMI DLLs if present
+          $smiDllPatterns = @(
+            "*smi*.dll",
+            "*rocm_smi*.dll"
+          )
+          foreach ($pattern in $smiDllPatterns) {
+            foreach ($src in @($rocmBinPath, $rocmLibPath)) {
+              if (Test-Path $src) {
+                $matchingDlls = Get-ChildItem -Path $src -Name $pattern -ErrorAction SilentlyContinue
+                if ($matchingDlls) {
+                  foreach ($dll in $matchingDlls) {
+                    $sourcePath = Join-Path $src $dll
+                    $destPath = Join-Path $buildBinPath $dll
+                    Copy-Item $sourcePath $destPath -Force
+                    Write-Host "Copied SMI DLL: $dll"
+                  }
+                }
+              }
+            }
+          }
+          
+          # Copy libexec/rocm_smi python package for rocm-smi
+          $rocmLibexecPath = "C:\opt\rocm\libexec\rocm_smi"
+          if (Test-Path $rocmLibexecPath) {
+            $destLibexecPath = "llama.cpp\build\libexec\rocm_smi"
+            New-Item -ItemType Directory -Force -Path $destLibexecPath | Out-Null
+            Copy-Item -Path $rocmLibexecPath\* -Destination $destLibexecPath -Recurse -Force
+            Write-Host "Copied libexec/rocm_smi to $destLibexecPath"
+          } else {
+            Write-Host "Info: libexec/rocm_smi not found at $rocmLibexecPath"
+          }
         } else {
           Write-Error "ROCm bin directory not found: $rocmBinPath"
           exit 1
@@ -406,16 +439,15 @@ jobs:
         
     - name: List build artifacts (including ROCm files)
       run: |
-        cd llama.cpp\build\bin
-        Write-Host "Final build artifacts (including ROCm core files):"
-        Get-ChildItem -Recurse | Format-Table Name, Length, LastWriteTime
+        Write-Host "Listing contents of llama.cpp\\build (including bin and libexec):"
+        Get-ChildItem -Recurse "llama.cpp\build" | Format-Table FullName, Length, LastWriteTime
         
     - name: Upload build artifacts
       id: upload-artifacts
       uses: actions/upload-artifact@v4
       with:
         name: llama-windows-rocm-${{ matrix.gfx_target }}-x64
-        path: llama.cpp/build/bin/
+        path: llama.cpp/build/
         retention-days: 30
         
     - name: Set job outputs
@@ -748,6 +780,7 @@ jobs:
       run: |
         build_bin_path="llama.cpp/build/bin"
         rocm_bin_path="/opt/rocm/bin"
+        rocm_lib_path="/opt/rocm/lib"
         
         echo "Copying ROCm tools (rocminfo, rocm-smi) to build directory..."
         echo "Source: $rocm_bin_path"
@@ -756,19 +789,35 @@ jobs:
         mkdir -p "$build_bin_path"
         cp -v "$rocm_bin_path/rocminfo"* "$build_bin_path/" 2>/dev/null || echo "rocminfo not found"
         cp -v "$rocm_bin_path/rocm-smi"* "$build_bin_path/" 2>/dev/null || echo "rocm-smi not found"
+
+        # Copy librocm_smi64 shared libraries needed by rocm-smi
+        cp -v "$rocm_lib_path/librocm_smi64.so"* "$build_bin_path/" 2>/dev/null || echo "librocm_smi64.so* not found"
+
+        # Copy libexec/rocm_smi python package so rocm-smi can import rsmiBindings
+        rocm_libexec_path="/opt/rocm/libexec/rocm_smi"
+        dest_libexec_path="llama.cpp/build/libexec/rocm_smi"
+        if [ -d "$rocm_libexec_path" ]; then
+          mkdir -p "$(dirname "$dest_libexec_path")"
+          mkdir -p "$dest_libexec_path"
+          cp -r "$rocm_libexec_path/"* "$dest_libexec_path/"
+          echo "Copied libexec/rocm_smi to $dest_libexec_path"
+        else
+          echo "libexec/rocm_smi not found at $rocm_libexec_path"
+        fi
         
     - name: List build artifacts (including ROCm files)
       run: |
-        cd llama.cpp/build/bin
-        echo "Final build artifacts (including ROCm library files):"
-        ls -la
+        echo "Final build artifacts under llama.cpp/build (including bin and libexec):"
+        find llama.cpp/build -maxdepth 2 -type d -print
+        echo "Top-level files in llama.cpp/build/bin:"
+        ls -la llama.cpp/build/bin || true
         
     - name: Upload build artifacts
       id: upload-artifacts
       uses: actions/upload-artifact@v4
       with:
         name: llama-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: llama.cpp/build/bin/
+        path: llama.cpp/build/
         retention-days: 30
         
     - name: Set job outputs
